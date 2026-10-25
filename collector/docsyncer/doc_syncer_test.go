@@ -95,7 +95,7 @@ func TestDbSync(t *testing.T) {
 		inputMarshal := marshalData(input)
 		assert.NotEqual(t, nil, inputMarshal, "should be equal")
 
-		err = de.doSync(inputMarshal)
+		err = de.doSync(inputMarshal, false)
 		assert.Equal(t, nil, err, "should be equal")
 
 		// fetch result
@@ -136,12 +136,12 @@ func TestDbSync(t *testing.T) {
 		inputMarshal = marshalData(input)
 		assert.NotEqual(t, nil, inputMarshal, "should be equal")
 
-		err = de.doSync(inputMarshal)
+		err = de.doSync(inputMarshal, false)
 		fmt.Println(err)
 		assert.NotEqual(t, nil, err, "should be equal")
 
 		conf.Options.FullSyncExecutorInsertOnDupUpdate = true
-		err = de.doSync(inputMarshal)
+		err = de.doSync(inputMarshal, false)
 		assert.Equal(t, nil, err, "should be equal")
 
 		// fetch result
@@ -224,7 +224,7 @@ func TestDbSync(t *testing.T) {
 		inputMarshal := marshalData(input)
 		assert.NotEqual(t, nil, inputMarshal, "should be equal")
 
-		err = de.doSync(inputMarshal)
+		err = de.doSync(inputMarshal, false)
 		assert.Equal(t, nil, err, "should be equal")
 
 		// fetch result
@@ -267,7 +267,7 @@ func TestDbSync(t *testing.T) {
 		inputMarshal = marshalData(input)
 		assert.NotEqual(t, nil, inputMarshal, "should be equal")
 
-		err = de.doSync(inputMarshal)
+		err = de.doSync(inputMarshal, false)
 		assert.Equal(t, nil, err, "should be equal")
 
 		// fetch result

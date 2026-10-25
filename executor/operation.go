@@ -24,7 +24,7 @@ func (exec *Executor) ensureConnection() bool {
 	// reconnect if necessary
 	if exec.conn == nil || !exec.conn.IsGood() {
 		writeConcern := utils.ReadWriteConcernDefault
-		if conf.Options.FullSyncExecutorMajorityEnable {
+		if conf.Options.IncrSyncExecutorMajorityEnable {
 			writeConcern = utils.ReadWriteConcernMajority
 		}
 

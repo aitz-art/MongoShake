@@ -1,14 +1,18 @@
 package docsyncer
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
 
 	conf "github.com/alibaba/MongoShake/v2/collector/configure"
 	utils "github.com/alibaba/MongoShake/v2/common"
@@ -18,6 +22,14 @@ import (
 var (
 	GlobalCollExecutorId int32 = -1
 	GlobalDocExecutorId  int32 = -1
+)
+
+// ponytail: hardcoded write-retry/timeout knobs for target failover; promote to config if Prod needs tuning.
+const (
+	writeRetryInitialDelay = 1 * time.Second
+	writeRetryMaxDelay     = 15 * time.Second
+	writeRetryMaxDuration  = 5 * time.Minute // per batch, from first failure
+	bulkWriteTimeout       = 120 * time.Second
 )
 
 type CollectionExecutor struct {
@@ -169,7 +181,7 @@ func (exec *DocExecutor) start() {
 		}
 
 		if exec.error == nil {
-			if err := exec.doSync(docs); err != nil {
+			if err := exec.syncWithRetry(docs); err != nil {
 				exec.error = err
 				// since v2.4.11: panic directly if meets error
 				l.Logger.Panicf("%s sync failed: %v", exec, err)
@@ -181,8 +193,98 @@ func (exec *DocExecutor) start() {
 	}
 }
 
-// use by full sync
-func (exec *DocExecutor) doSync(docs []*bson.Raw) error {
+// syncWithRetry retries the whole batch on transient write errors (e.g. target
+// failover) with exponential backoff, bounded by writeRetryMaxDuration.
+func (exec *DocExecutor) syncWithRetry(docs []*bson.Raw) error {
+	err := exec.doSync(docs, false)
+	if err == nil {
+		return nil
+	}
+	deadline := time.Now().Add(writeRetryMaxDuration)
+	delay := writeRetryInitialDelay
+	for attempt := 1; err != nil && isTransientWriteError(err) && time.Now().Before(deadline); attempt++ {
+		l.Logger.Warnf("%s batch size[%d] transient write error, retry attempt[%d] in %v: %v",
+			exec, len(docs), attempt, delay, err)
+		time.Sleep(delay)
+		delay = min(delay*2, writeRetryMaxDelay)
+		err = exec.doSync(docs, true)
+	}
+	return err
+}
+
+// isTransientWriteError reports whether a write error is caused by a transient
+// condition (failover, network, pool cleared) so the batch can be retried.
+func isTransientWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if mongo.IsNetworkError(err) || mongo.IsTimeout(err) {
+		return true
+	}
+	if errors.As(err, &topology.ConnectionError{}) {
+		return true
+	}
+	var r interface{ Retryable() bool }
+	if errors.As(err, &r) && r.Retryable() {
+		return true
+	}
+	var se mongo.ServerError
+	if errors.As(err, &se) {
+		if se.HasErrorLabel("RetryableWriteError") {
+			return true
+		}
+		// NotWritablePrimary, InterruptedDueToReplStateChange, HostUnreachable, ... (incl. WCE codes)
+		for _, code := range []int{6, 7, 64, 89, 91, 189, 262, 9001, 10107, 11600, 11602, 13435, 13436} {
+			if se.HasErrorCode(code) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isIDDupKey reports whether the write error is a duplicate key error on the _id index.
+func isIDDupKey(we mongo.WriteError) bool {
+	if !utils.DuplicateKey(we) {
+		return false
+	}
+	kp, err := we.Raw.LookupErr("keyPattern")
+	if err != nil {
+		return strings.Contains(we.Message, "index: _id_ ")
+	}
+	doc, ok := kp.DocumentOK()
+	if !ok {
+		return false
+	}
+	elems, err := doc.Elements()
+	return err == nil && len(elems) == 1 && elems[0].Key() == "_id"
+}
+
+// filterRetryDupErrors drops _id duplicate key errors when allowSkip is set:
+// on a retry they are documents already written by the failed attempt.
+func filterRetryDupErrors(writeErrors []mongo.BulkWriteError, allowSkip bool) []mongo.BulkWriteError {
+	if !allowSkip {
+		return writeErrors
+	}
+	var remain []mongo.BulkWriteError
+	for _, we := range writeErrors {
+		if !isIDDupKey(we.WriteError) {
+			remain = append(remain, we)
+		}
+	}
+	return remain
+}
+
+// bulkWrite runs BulkWrite with a per-call timeout.
+func (exec *DocExecutor) bulkWrite(ns utils.NS, models []mongo.WriteModel) (*mongo.BulkWriteResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), bulkWriteTimeout)
+	defer cancel()
+	return exec.conn.Client.Database(ns.Database).Collection(ns.Collection).
+		BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+}
+
+// use by full sync. retry=true means a previous attempt of the same batch failed.
+func (exec *DocExecutor) doSync(docs []*bson.Raw, retry bool) error {
 	if len(docs) == 0 || conf.Options.FullSyncExecutorDebug {
 		return nil
 	}
@@ -228,8 +330,7 @@ func (exec *DocExecutor) doSync(docs []*bson.Raw) error {
 		}
 	}
 
-	opts := options.BulkWrite().SetOrdered(false)
-	res, err := exec.conn.Client.Database(ns.Database).Collection(ns.Collection).BulkWrite(nil, models, opts)
+	res, err := exec.bulkWrite(ns, models)
 
 	if err != nil {
 		bulkErr, ok := err.(mongo.BulkWriteException)
@@ -245,10 +346,17 @@ func (exec *DocExecutor) doSync(docs []*bson.Raw) error {
 		// updateDocs[i] and updateFilters[i] correspond to updateModels[i].
 		var updateDocs []*bson.Raw
 		var updateFilters []bson.D
-		for _, wError := range bulkErr.WriteErrors {
+		allowSkip := retry && conf.Options.FullSyncCollectionDrop
+		remainErrors := filterRetryDupErrors(bulkErr.WriteErrors, allowSkip)
+		if ok && len(remainErrors) == 0 && bulkErr.WriteConcernError == nil {
+			l.Logger.Infof("%s retry: all %d write errors are _id duplicates from the previous attempt, skipped",
+				exec, len(bulkErr.WriteErrors))
+			return nil
+		}
+		for _, wError := range remainErrors {
 			if utils.DuplicateKey(wError) {
 				if !conf.Options.FullSyncExecutorInsertOnDupUpdate {
-					return fmt.Errorf("duplicate key error[%v], you can clean the document on the target mongodb, "+
+					return fmt.Errorf("duplicate key error[%w], you can clean the document on the target mongodb, "+
 						"or enable %v to solve, but full-sync stage needs restart",
 						wError, "full_sync.executor.insert_on_dup_update")
 				}
@@ -266,20 +374,19 @@ func (exec *DocExecutor) doSync(docs []*bson.Raw) error {
 					}
 				}
 				if updateFilterBool == false {
-					return fmt.Errorf("duplicate key error[%v], can't get _id from document", wError)
+					return fmt.Errorf("duplicate key error[%w], can't get _id from document", wError)
 				}
 				updateModels = append(updateModels, mongo.NewUpdateOneModel().
 					SetFilter(updateFilter).SetUpdate(bson.D{{"$set", dupDocument}}))
 				updateDocs = append(updateDocs, modelDocs[wError.Index])
 				updateFilters = append(updateFilters, updateFilter)
 			} else {
-				return fmt.Errorf("bulk run failed[%v]", wError)
+				return fmt.Errorf("bulk run failed[%w]", wError)
 			}
 		}
 
 		if len(updateModels) != 0 {
-			updOpts := options.BulkWrite().SetOrdered(false)
-			_, upErr := exec.conn.Client.Database(ns.Database).Collection(ns.Collection).BulkWrite(nil, updateModels, updOpts)
+			_, upErr := exec.bulkWrite(ns, updateModels)
 			if upErr != nil {
 				// Check if the update failed due to immutable shard key field.
 				// On sharded collections, $set on an immutable shard key field is
@@ -297,7 +404,8 @@ func (exec *DocExecutor) doSync(docs []*bson.Raw) error {
 					// dup-key documents from the insert.
 					var deleteModels []mongo.WriteModel
 					var reInsertModels []mongo.WriteModel
-					if updBulkErr, ok := upErr.(mongo.BulkWriteException); ok {
+					updBulkErr, updIsBulk := upErr.(mongo.BulkWriteException)
+					if updIsBulk {
 						for _, wError := range updBulkErr.WriteErrors {
 							if wError.Index < 0 || wError.Index >= len(updateDocs) {
 								continue
@@ -317,28 +425,35 @@ func (exec *DocExecutor) doSync(docs []*bson.Raw) error {
 
 					if len(deleteModels) > 0 {
 						// Phase 1: Delete old documents by _id
-						delOpts := options.BulkWrite().SetOrdered(false)
-						_, delErr := exec.conn.Client.Database(ns.Database).Collection(ns.Collection).BulkWrite(nil, deleteModels, delOpts)
+						_, delErr := exec.bulkWrite(ns, deleteModels)
 						if delErr != nil {
-							return fmt.Errorf("delete+insert fallback: delete failed on ns[%v]: %v", ns, delErr)
+							return fmt.Errorf("delete+insert fallback: delete failed on ns[%v]: %w", ns, delErr)
 						}
 
 						// Phase 2: Re-insert with new shard key values
-						insOpts := options.BulkWrite().SetOrdered(false)
-						_, insErr := exec.conn.Client.Database(ns.Database).Collection(ns.Collection).BulkWrite(nil, reInsertModels, insOpts)
+						_, insErr := exec.bulkWrite(ns, reInsertModels)
 						if insErr != nil {
-							return fmt.Errorf("delete+insert fallback: re-insert failed on ns[%v]: %v", ns, insErr)
+							return fmt.Errorf("delete+insert fallback: re-insert failed on ns[%v]: %w", ns, insErr)
 						}
 						l.Logger.Infof("delete+insert fallback succeeded for %d docs on ns[%v]", len(deleteModels), ns)
+						if updIsBulk && updBulkErr.WriteConcernError != nil {
+							return fmt.Errorf("bulk run updateForInsert failed[%w]", upErr)
+						}
+						if bulkErr.WriteConcernError != nil {
+							return fmt.Errorf("bulk run failed[%w]", err)
+						}
 						return nil
 					}
 				}
-				return fmt.Errorf("bulk run updateForInsert failed[%v]", upErr)
+				return fmt.Errorf("bulk run updateForInsert failed[%w]", upErr)
 			}
 			l.Logger.Debugf("updateForInsert succeed, updateModels.len:%d updateModules[0]:%v",
 				len(updateModels), updateModels[0])
+			if bulkErr.WriteConcernError != nil {
+				return fmt.Errorf("bulk run failed[%w]", err)
+			}
 		} else {
-			return fmt.Errorf("bulk run failed[%v]", err)
+			return fmt.Errorf("bulk run failed[%w]", err)
 		}
 	}
 
