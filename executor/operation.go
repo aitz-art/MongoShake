@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -53,6 +54,24 @@ func (exec *Executor) ensureConnection() bool {
 func (exec *Executor) dropConnection() {
 	exec.conn.Close()
 	exec.conn = nil
+}
+
+// isStateChangeError reports whether err carries a "not primary" / "node is
+// shutting down" server error code, i.e. the target node is no longer writable.
+func isStateChangeError(err error) bool {
+	var se mongo.ServerError
+	if !errors.As(err, &se) {
+		return false
+	}
+	// NotWritablePrimary, NotPrimaryNoSecondaryOk, LegacyNotPrimary, NotPrimaryOrSecondary, PrimarySteppedDown,
+	// InterruptedDueToReplStateChange, InterruptedAtShutdown, ShutdownInProgress
+	// (same as the driver notPrimaryCodes + nodeIsRecoveringCodes)
+	for _, code := range []int{10107, 13435, 10058, 13436, 189, 11602, 11600, 91} {
+		if se.HasErrorCode(code) {
+			return true
+		}
+	}
+	return false
 }
 
 func (exec *Executor) execute(group *OplogsGroup) error {
@@ -136,8 +155,10 @@ func (exec *Executor) execute(group *OplogsGroup) error {
 				" error[%v], logs number[%d], firstLog: %s",
 				exec.batchExecutor.ReplayerId, exec.id, group.ns, group.op, reflect.TypeOf(err), err.Error(), count,
 				group.oplogRecords[0].original.partialLog)
-			// only rebuild the client on connection-level errors, server errors keep it
-			if mongo.IsNetworkError(err) || mongo.IsTimeout(err) {
+			// rebuild the client on connection-level errors and on replica-set state
+			// changes (e.g. pooled conns landed on a secondary behind HAProxy with
+			// directConnection=true: the driver does not clear its pool on "not primary")
+			if mongo.IsNetworkError(err) || mongo.IsTimeout(err) || isStateChangeError(err) {
 				exec.dropConnection()
 			}
 			atomic.AddUint64(&exec.metricError, uint64(len(group.oplogRecords)))
