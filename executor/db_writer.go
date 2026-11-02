@@ -200,9 +200,9 @@ func RunCommand(database, operation string, log *oplog.PartialLog, client *mongo
 		 * Strictly speaking, we should handle applyOps nested case, but it is
 		 * complicate to fulfill, so we just use "applyOps" to run the command directly.
 		 */
-		ops, err := oplog.NormalizeApplyOps(log.Object)
-		if err != nil {
-			return err
+		ops, nerr := oplog.NormalizeApplyOps(log.Object)
+		if nerr != nil {
+			return nerr
 		}
 
 		var store bson.D

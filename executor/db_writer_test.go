@@ -2950,3 +2950,25 @@ func TestSingleWriterDeleteOnNonIdDupKeyDisabled(t *testing.T) {
 
 	_ = conn.Client.Database(testDb).Drop(nil)
 }
+
+// TestRunCommandApplyOpsReturnsError guards against the applyOps case shadowing
+// RunCommand's err: a failed nested applyOps must not be reported as success.
+func TestRunCommandApplyOpsReturnsError(t *testing.T) {
+	_ = utils.InitialLogger("", "", "debug", true, 1)
+
+	client, err := mongo.Connect(context.Background(), options.Client().
+		ApplyURI("mongodb://127.0.0.1:1/?directConnection=true&serverSelectionTimeoutMS=200&connectTimeoutMS=200"))
+	assert.NoError(t, err)
+	defer client.Disconnect(context.Background())
+
+	log := &oplog.PartialLog{
+		ParsedLog: oplog.ParsedLog{
+			Operation: "c",
+			Namespace: "admin.$cmd",
+			Object: bson.D{{Key: "applyOps", Value: []bson.D{
+				{{Key: "op", Value: "i"}, {Key: "ns", Value: "zz.y"}, {Key: "o", Value: bson.D{{Key: "_id", Value: 1}}}},
+			}}},
+		},
+	}
+	assert.Error(t, RunCommand(testDb, "applyOps", log, client))
+}
