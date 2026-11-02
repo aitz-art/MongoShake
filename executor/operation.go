@@ -63,9 +63,10 @@ func isStateChangeError(err error) bool {
 	if !errors.As(err, &se) {
 		return false
 	}
-	// NotWritablePrimary, NotPrimaryNoSecondaryOk, NotPrimaryOrSecondary, PrimarySteppedDown,
+	// NotWritablePrimary, NotPrimaryNoSecondaryOk, LegacyNotPrimary, NotPrimaryOrSecondary, PrimarySteppedDown,
 	// InterruptedDueToReplStateChange, InterruptedAtShutdown, ShutdownInProgress
-	for _, code := range []int{10107, 13435, 13436, 189, 11602, 11600, 91} {
+	// (same as the driver notPrimaryCodes + nodeIsRecoveringCodes)
+	for _, code := range []int{10107, 13435, 10058, 13436, 189, 11602, 11600, 91} {
 		if se.HasErrorCode(code) {
 			return true
 		}

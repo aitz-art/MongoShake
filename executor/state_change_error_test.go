@@ -19,6 +19,7 @@ func TestIsStateChangeError(t *testing.T) {
 		{"plain error", errors.New("not primary"), false},
 		{"CommandError NotWritablePrimary", notPrimary, true},
 		{"CommandError InterruptedDueToReplStateChange", mongo.CommandError{Code: 11602}, true},
+		{"CommandError LegacyNotPrimary", mongo.CommandError{Code: 10058}, true},
 		{"wrapped %w", fmt.Errorf("delete+insert fallback: %w", notPrimary), true},
 		{"wrapped %v loses code", fmt.Errorf("x: %v", notPrimary), false},
 		{"WriteException WriteConcernError", mongo.WriteException{
